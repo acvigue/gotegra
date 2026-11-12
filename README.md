@@ -25,12 +25,21 @@ bulk-OUT transfers. Doing the USB natively here sidesteps that entirely.
   a Jetson Orin NX confirmed). macOS-only for now.
 - `mb2probe` / `reboot` — the mb2/applet 3p command transport.
   **Implemented, not yet hardware-verified.**
+- `burnfuses` (alias `fuse`) — FSKP fuse burning for T234/Orin. Builds the FSKP
+  RCM session (bootrom blobs → pollbl → mem BCT + `blob.bin`) that boots the
+  signed FSKP MB2, which burns the fuses; or, with `-via-applet`, sends
+  `--oem burnfuses` to a running mb2_applet over the 3p protocol. **Dry run by
+  default; the real burn is gated behind `-burn` and never run against hardware
+  here. IRREVERSIBLE.** Transport reversed from `tegrarcm_v2`; the FSKP path
+  reuses the (unverified) `flashboot` transport.
 
 The signed blobs themselves are produced by NVIDIA's offline tools
 (`tegraflash`/`tegrabct`/`tegrasign`, which need no USB); gotegra only does the
-USB transport. The flashing inputs are a *flashpack* (`rcmboot/` RCM blobs,
-`flashpkg.img` ext4 command package, `flashparts/` with `flash.idx` + partition
-images + the rootfs), as produced by luka-firmware's `ci/flashpack.sh`.
+USB transport. Fuse blobs are likewise built and signed offline (odmfuse via
+`tegraparser` + `tegrasign_v3`); gotegra never signs or assembles them. The
+flashing inputs are a *flashpack* (`rcmboot/` RCM blobs, `flashpkg.img` ext4
+command package, `flashparts/` with `flash.idx` + partition images + the
+rootfs), as produced by luka-firmware's `ci/flashpack.sh`.
 
 ### Flashing flow (what the device-side agent does)
 
@@ -102,6 +111,9 @@ gotegra pkg-seq  <in.img> <out.img> 'verb;verb'    # new command sequence
 gotegra pkg-drop <in.img> <out.img> <verb>...      # remove verbs
 
 gotegra uid | flashboot | applet-boot | rcmboot | applet | mb2probe | reboot
+
+gotegra burnfuses <blob-dir>           # dry run (FSKP); -burn to burn (IRREVERSIBLE)
+gotegra burnfuses -via-applet <blob>   # --oem burnfuses over 3p to a running applet
 ```
 
 A flashpack directory holds `rcmboot/`, `flashpkg.img` and `flashparts/`; the
@@ -125,4 +137,26 @@ status line every 15 s showing what the USB tree sees.
 - `--pollbl` is a 0x44-byte bulk-IN on EP `0x81` (bootloader version +
   last_boot_error); the applet must follow promptly or MB1 boots the on-flash OS.
 - The mb2 "3p" protocol: 16-byte header `[magic=3][type][seq_lo][seq_hi]`,
-  optional `[len][payload][checksum]`, ACK(3)/NACK(4), byte-sum checksum.
+  optional `[len][payload][checksum]`, ACK(3)/NACK(4), byte-sum checksum. A 3p
+  *command* is a type-1 packet whose payload is `[opcode u32][command struct]`;
+  the opcode is the RCM command (`NvTegra3pCommandSend`): 2 = download,
+  6 = OEM command, 9 = command-complete, 10 = boot.
+- **Fuse burning (FSKP, T234/Orin).** gotegra is only the RCM transport; the
+  fuse values live in a fuse XML (`fuse_t234.xml`, `MagicId=0x45535546` = "FUSE"),
+  are compiled to a fuse blob by `tegraparser --fuse_info`, concatenated into
+  `fskp_t234.bin` (`tegraparser --fskp_info`), and encrypted+signed offline by
+  `tegrasign_v3` (AES-GCM under `FSKP_EK`, then HMAC-SHA256 under `FSKP_AK` —
+  `tegraflash_oem_sign_fskp`). gotegra never builds or signs the blob. Two
+  transports, both reversed from `tegrarcm_v2`:
+  - **FSKP-as-MB2 (the T234 `tegraflash burnfuses` path, production).** The signed
+    FSKP MB2 is packed into `blob.bin`, and the RCM sequence is identical to a
+    flash boot: bootrom blobs (raw bulk-OUT) → `pollbl` → `--download bct_mem`
+    (mem BCT) → `--download blob` (blob.bin), all raw bulk-OUT. Post-`pollbl`
+    `--download` to MB1 is raw bulk-OUT, not 3p (`NvTegraAppletHandleDownload`
+    falls back to the bootloader download when no applet is running). MB1 then
+    runs the FSKP MB2, which burns the fuses. This reuses `flashboot`.
+  - **Applet `--oem burnfuses` (generic path).** To a running `mb2_applet`: a
+    type-1 command packet `[6][6,0,0,0]` (opcode 6 = OEM, OEM cmd 6 = burnfuses),
+    then the signed fuse blob as one type-2 data packet, then a status packet
+    (opcode 8; status u64 `0` = success) — `NvTegraRunOemCmd`. Not used by T234
+    `tegraflash burnfuses`; provided for applet-based fusing.

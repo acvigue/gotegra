@@ -92,6 +92,16 @@ it waits for the box to return to RCM.`,
 		{name: "mb2probe", short: "query a running mb2 applet over the 3p protocol", run: cmdMb2Probe},
 		{name: "reboot", args: "[recovery|coldboot]", short: "ask a running mb2 applet to reboot (default recovery)", run: cmdReboot},
 	}},
+	{"Burn fuses — IRREVERSIBLE (device in recovery mode)", []command{
+		{name: "burnfuses", args: "[-burn] [-yes] <fuse-blob-dir>   |   -via-applet [-burn] <fuse-blob.bin>",
+			short: "FSKP fuse burn (T234/Orin); dry run unless -burn",
+			long: `gotegra only transports the already-signed fuse blob built offline by
+odmfuse/tegraparser/tegrasign_v3; it never signs. Dry run by default (no device
+needed); -burn performs the IRREVERSIBLE burn after a typed confirmation (-yes
+skips it). -via-applet sends "--oem burnfuses <blob>" to a running mb2_applet
+over the 3p protocol instead of the FSKP RCM session.`,
+			run: cmdBurnFuses},
+	}},
 }
 
 func lookup(name string) *command {
@@ -111,6 +121,9 @@ func main() {
 		os.Exit(2)
 	}
 	name, args := os.Args[1], os.Args[2:]
+	if name == "fuse" {
+		name = "burnfuses"
+	}
 	switch name {
 	case "-h", "--help", "help":
 		if len(args) > 0 {
@@ -432,6 +445,118 @@ func cmdMb2Probe(args []string) error {
 		return errUsage
 	}
 	return withDevice(func(d *gotegra.Device) error { return d.Mb2Probe() })
+}
+
+// cmdBurnFuses implements `gotegra burnfuses` (alias `fuse`): the FSKP fuse-burn
+// RCM session for T234/Orin, or the generic `--oem burnfuses` applet path with
+// -via-applet. Dry run by default; -burn performs the IRREVERSIBLE burn.
+func cmdBurnFuses(args []string) error {
+	fs := flag.NewFlagSet("burnfuses", flag.ContinueOnError)
+	burn := fs.Bool("burn", false, "actually burn the fuses (IRREVERSIBLE); omit for a dry run")
+	yes := fs.Bool("yes", false, "skip the interactive confirmation (only with -burn)")
+	viaApplet := fs.Bool("via-applet", false, "send `--oem burnfuses <fuse-blob>` to a running mb2_applet over 3p (arg is a fuse-blob file) instead of the FSKP RCM session (arg is a blob dir)")
+	fs.Usage = func() {
+		fmt.Fprint(os.Stderr, "usage: gotegra burnfuses [-burn] [-yes] <fuse-blob-dir>\n"+
+			"       gotegra burnfuses -via-applet [-burn] [-yes] <fuse-blob.bin>\n\n"+
+			"Burns T234/Orin fuses via FSKP. gotegra only transports the already-signed\n"+
+			"blob produced offline by odmfuse/tegraparser/tegrasign_v3; it never signs.\n"+
+			"Fuse burning is IRREVERSIBLE: dry run is the default, -burn performs the burn.\n")
+	}
+	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return nil
+		}
+		return err
+	}
+	rest := fs.Args()
+	if len(rest) != 1 {
+		fs.Usage()
+		return fmt.Errorf("expected exactly one path argument")
+	}
+	if *viaApplet {
+		return burnFusesApplet(rest[0], *burn, *yes)
+	}
+	return burnFusesFSKP(rest[0], *burn, *yes)
+}
+
+func burnFusesFSKP(dir string, burn, yes bool) error {
+	bootBlobs, postBlobs, err := gotegra.ResolveFuseBlobs(dir)
+	if err != nil {
+		return err
+	}
+	plan, err := gotegra.BuildFSKPBurnPlan(bootBlobs, postBlobs)
+	if err != nil {
+		return err
+	}
+	fmt.Print(plan.String())
+	if !burn {
+		fmt.Println("\nDRY RUN — no USB I/O performed. Re-run with -burn to burn (IRREVERSIBLE).")
+		return nil
+	}
+	d, err := openAndConfirm("FSKP fuse burn", yes)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.BurnFusesFSKP(plan)
+}
+
+func burnFusesApplet(blobPath string, burn, yes bool) error {
+	data, err := os.ReadFile(blobPath)
+	if err != nil {
+		return err
+	}
+	if len(data) == 0 {
+		return fmt.Errorf("fuse blob %s is empty", blobPath)
+	}
+	fmt.Printf("Applet --oem burnfuses (3p) for %s (%d bytes):\n", filepath.Base(blobPath), len(data))
+	fmt.Println("  1. type-1 command packet: payload [opcode 6 = OEM][oem cmd 6 = burnfuses]")
+	fmt.Println("  2. type-2 data packet:    the signed fuse blob")
+	fmt.Println("  3. read the device status packet (opcode 8; 0 = success)")
+	if !burn {
+		fmt.Println("\nDRY RUN — no USB I/O performed. Re-run with -burn to burn (IRREVERSIBLE).")
+		return nil
+	}
+	d, err := openAndConfirm("applet --oem burnfuses", yes)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.BurnFusesApplet(data)
+}
+
+// openAndConfirm opens the device, prints its BR_CID and current fuse /
+// secure-boot state so the operator can see exactly which chip (by CID/ECID) and
+// what it is today, then asks for an irreversible-burn confirmation. It returns
+// the open device only on an explicit "BURN" (or -yes), and closes it otherwise.
+func openAndConfirm(what string, yes bool) (*gotegra.Device, error) {
+	d, err := gotegra.Open()
+	if err != nil {
+		return nil, err
+	}
+	cid, _, err := d.ReadBRCID()
+	if err != nil {
+		d.Close()
+		return nil, fmt.Errorf("read BR_CID: %w", err)
+	}
+	fmt.Printf("device BR_CID: %s\n", cid)
+	if st, ok := gotegra.DecodeFuseState(cid); ok {
+		fmt.Printf("current fuse/secure-boot state: %s\n", st)
+	}
+	if !yes && !confirmBurn(what) {
+		d.Close()
+		return nil, fmt.Errorf("aborted")
+	}
+	return d, nil
+}
+
+// confirmBurn asks the operator to type BURN on stdin before an irreversible burn.
+func confirmBurn(what string) bool {
+	fmt.Fprintf(os.Stderr, "\n*** WARNING: %s is IRREVERSIBLE and can permanently brick the device. ***\n", what)
+	fmt.Fprint(os.Stderr, "Type BURN to proceed: ")
+	var in string
+	fmt.Scanln(&in)
+	return in == "BURN"
 }
 
 func cmdReboot(args []string) error {

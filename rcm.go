@@ -82,7 +82,10 @@ func ResolveRcmBlobs(dir string) (bootBlobs []string, applet string, err error) 
 		}
 		return "", fmt.Errorf("no blob matching %v in %s", patterns, dir)
 	}
-	order := []struct{ name string; pats []string }{
+	order := []struct {
+		name string
+		pats []string
+	}{
 		{"bct_br", []string{"br_bct_BR.bct", "br_bct*.bct"}},
 		{"mb1", []string{"mb1_t234*sigheader.bin.encrypt", "mb1_t234*.bin.encrypt"}},
 		{"psc_bl1", []string{"psc_bl1_*sigheader.bin.encrypt", "psc_bl1_*.bin.encrypt"}},

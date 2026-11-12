@@ -16,6 +16,7 @@ package gotegra
 
 import (
 	"fmt"
+	"time"
 	"unsafe"
 
 	"github.com/ebitengine/purego"
@@ -26,12 +27,61 @@ const (
 	VendorNVIDIA = 0x0955
 	ProductT234  = 0x7323 // Orin (T234) APX
 
+	// The flashing initrd (once RCM-booted) comes up as this USB gadget — the
+	// "Linux for Tegra" mass-storage device (gadget-vid-pid-remove 1d6b:104).
+	VendorLinuxFdn  = 0x1d6b
+	ProductL4TFlash = 0x0104
+	// The agent's progress gadget (CDC-ACM), bound only between LUNs.
+	ProductL4TProgress = 0x0105
+
 	epBulkOut = 0x01
 	epBulkIn  = 0x81
 
 	// tegrarcm_v2 writes/reads usbdevfs bulk URBs in 16 KiB chunks; mirror that.
 	bulkChunk = 0x4000
 )
+
+// DisconnectGadget signals the Tegra flashing gadget (1d6b:0104) that the host
+// is done with the current mass-storage LUN, so the device-side initrd agent's
+// wait_for_disconnect returns and it moves on (mount the flashpkg, or export the
+// next block device). That agent polls /sys/class/udc/<udc>/state once per
+// second and proceeds only when it reads a state other than "configured".
+//
+// The reliable way to trip that is SET_CONFIGURATION 0: it leaves the gadget in
+// the "addressed" (un-configured) state and HOLDS it there — while we keep the
+// device open (seized) macOS cannot re-configure it — so the 1 s poll is certain
+// to sample it. We hold briefly, by which point the device has seen the
+// disconnect and unbound its own UDC. A bare USB reset (ReEnumerate) only
+// un-configures for the few-hundred-ms re-enumeration window, which the 1 s poll
+// usually misses — that is why `diskutil eject` and a plain reset both hung. We
+// fall back to a reset only if SET_CONFIGURATION is refused. Returns the method
+// used, for logging. Not-open is reported so the caller can retry or prompt.
+func DisconnectGadget() (string, error) {
+	lib, err := loadLibusb()
+	if err != nil {
+		return "", err
+	}
+	var ctx uintptr
+	if rc := lib.Init(&ctx); rc != 0 {
+		return "", fmt.Errorf("libusb_init: %s", lib.strerr(rc))
+	}
+	defer lib.Exit(ctx)
+	h := lib.OpenVIDPID(ctx, VendorLinuxFdn, ProductL4TFlash)
+	if h == 0 {
+		return "", fmt.Errorf("flashing gadget %04x:%04x not open", VendorLinuxFdn, ProductL4TFlash)
+	}
+	defer lib.Close(h)
+	if rc := lib.SetConfiguration(h, 0); rc == 0 {
+		// Hold the un-configured state (seized, so macOS cannot re-configure)
+		// long enough for the agent's 1 s poll to sample it and unbind the UDC.
+		time.Sleep(2500 * time.Millisecond)
+		return "unconfigure", nil
+	} else if rcR := lib.ResetDevice(h); rcR == 0 {
+		return fmt.Sprintf("reset-fallback (set_config0=%s)", lib.strerr(rc)), nil
+	} else {
+		return "", fmt.Errorf("set_config(0)=%s, reset=%s", lib.strerr(rc), lib.strerr(rcR))
+	}
+}
 
 // libusb binds the handful of libusb-1.0 entry points we need. Signatures match
 // libusb.h; purego marshals the integer/pointer args without cgo.
@@ -131,13 +181,32 @@ func Open() (*Device, error) {
 		return nil, fmt.Errorf("no NVIDIA Tegra device in recovery mode (%04x:%04x) found", VendorNVIDIA, ProductT234)
 	}
 	d := &Device{lib: lib, ctx: ctx, handle: h}
-	lib.SetAutoDetach(h, 1)   // harmless NOT_SUPPORTED on macOS
+	lib.SetAutoDetach(h, 1)    // harmless NOT_SUPPORTED on macOS
 	lib.SetConfiguration(h, 1) // usually already 1; ignore result
 	if rc := lib.ClaimInterface(h, 0); rc != 0 {
 		d.Close()
 		return nil, fmt.Errorf("claim interface 0: %s", lib.strerr(rc))
 	}
 	return d, nil
+}
+
+// OpenWait is Open, retried until the RCM device shows up or timeout passes —
+// for chaining runs: after the agent's `reboot forced-recovery` the box takes a
+// few seconds to re-enumerate as 0955:7323.
+func OpenWait(timeout time.Duration) (*Device, error) {
+	deadline := time.Now().Add(timeout)
+	announced := false
+	for {
+		d, err := Open()
+		if err == nil || time.Now().After(deadline) {
+			return d, err
+		}
+		if !announced {
+			fmt.Printf("waiting up to %s for the RCM device (%04x:%04x)...\n", timeout, VendorNVIDIA, ProductT234)
+			announced = true
+		}
+		time.Sleep(time.Second)
+	}
 }
 
 // Close releases the interface and frees the libusb context.

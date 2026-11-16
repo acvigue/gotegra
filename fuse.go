@@ -142,6 +142,9 @@ func (d *Device) BurnFusesFSKP(plan *FSKPBurnPlan) error {
 		if st, ok := DecodeFuseState(cid); ok {
 			fmt.Printf("current fuse/secure-boot state: %s\n", st)
 		}
+		if err := CheckSigning(cid, plan.bootOrder()); err != nil {
+			return err
+		}
 	}
 	fmt.Println("RCM-booting the FSKP fuse-burn chain (bootrom blobs)...")
 	if err := d.RcmBoot(plan.bootOrder()); err != nil {

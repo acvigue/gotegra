@@ -41,6 +41,23 @@ flashing inputs are a *flashpack* (`rcmboot/` RCM blobs, `flashpkg.img` ext4
 command package, `flashparts/` with `flash.idx` + partition images + the
 rootfs), as produced by luka-firmware's `ci/flashpack.sh`.
 
+The signed RCM blobs come in two spellings, and a unit takes one of them:
+`*.encrypt` is signed with the zero key, for an unfused (NS) unit; `*.signed` is
+signed with a PKC key, for a unit whose `PublicKeyHash` fuse holds that key's
+hash. gotegra takes whichever the directory holds, and
+
+- refuses a directory that holds both (two builds copied into one place: sent
+  by name, the set would be a mix no unit boots);
+- reads `BR_CID` before the first download and refuses to send PKC-signed blobs
+  to an unfused unit, or zero-key blobs to a fused one. Every command that
+  RCM-boots from a blob directory does this (`flashall`, `flashqspi`,
+  `probe-nvme`, `run-pkg`, `flashboot`, `applet-boot`, `burnfuses`); `rcmboot`
+  and `applet` send exactly the files they are given. NVIDIA's flasher draws the
+  same line.
+
+Resolving PKC-signed blobs is tested on the file names of a real PKC flashpack;
+**sending them to a fused unit is not hardware-verified** (no fused unit yet).
+
 ### Flashing flow (what the device-side agent does)
 
 The agent is the initramfs `/init` inside `blob.bin` (meta-tegra initrd-flash).

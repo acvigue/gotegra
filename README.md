@@ -11,6 +11,13 @@ device through Linux `usbdevfs` ioctls; the only way to run it on an Apple-Silic
 Mac is a QEMU x86 guest whose emulated USB passthrough can't complete the RCM
 bulk-OUT transfers. Doing the USB natively here sidesteps that entirely.
 
+## Install
+
+```
+go install github.com/acvigue/gotegra/cmd/gotegra@latest     # the command
+go get github.com/acvigue/gotegra                            # the package
+```
+
 ## Status
 
 - `uid` — read `BR_CID` (USB string descriptor #3) and decode the fuse /

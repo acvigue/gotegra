@@ -12,7 +12,7 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/levitree/gotegra"
+	"github.com/acvigue/gotegra"
 )
 
 // command is one gotegra subcommand.

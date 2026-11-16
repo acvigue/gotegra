@@ -1,4 +1,4 @@
-module github.com/levitree/gotegra
+module github.com/acvigue/gotegra
 
 go 1.27.2
 
